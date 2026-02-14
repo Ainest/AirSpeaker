@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import pychromecast
+import zeroconf as zc
 
 from . import config
 
@@ -79,13 +80,19 @@ class CastController:
     def _discover_blocking(self, timeout: float) -> list[CastDevice]:
         logger.info("Discovering Chromecast devices (timeout=%ds)...", timeout)
         try:
-            services, browser = pychromecast.discovery.discover_chromecasts(timeout=timeout)
-            pychromecast.discovery.stop_discovery(browser)
+            zconf = zc.Zeroconf()
+            listener = pychromecast.SimpleCastListener()
+            browser = pychromecast.CastBrowser(listener, zconf)
+            browser.start_discovery()
+            time.sleep(timeout)
+            browser.stop_discovery()
 
             self._discovered_devices.clear()
-            for info in services:
+            for uuid, info in browser.devices.items():
                 dev = CastDevice.from_cast_info(info)
                 self._discovered_devices[dev.uuid] = dev
+
+            zconf.close()
 
             devices = list(self._discovered_devices.values())
             logger.info("Found %d device(s): %s", len(devices),
@@ -191,18 +198,34 @@ class CastController:
 
     def _reconnect_loop(self) -> None:
         """Monitor connection and reconnect if playback stops."""
+        # Grace period: let Chromecast buffer and start playing
+        grace_until = time.monotonic() + 15
+        idle_count = 0
+
         while self._should_reconnect:
             time.sleep(config.CAST_RETRY_INTERVAL)
             if not self._should_reconnect:
                 break
             if not self._cast:
                 break
+
+            # Skip checks during grace period
+            if time.monotonic() < grace_until:
+                continue
+
             try:
                 mc = self._cast.media_controller
                 status = mc.status
-                # If player is idle or in error, restart playback
                 if status and status.player_state in ("IDLE", "UNKNOWN"):
-                    logger.info("Playback stopped, restarting stream...")
-                    self._play_stream()
+                    idle_count += 1
+                    # Only restart after 2 consecutive IDLE checks
+                    if idle_count >= 2:
+                        logger.info("Playback stopped (state=%s), restarting stream...",
+                                    status.player_state)
+                        self._play_stream()
+                        grace_until = time.monotonic() + 15
+                        idle_count = 0
+                else:
+                    idle_count = 0
             except Exception:
                 logger.warning("Reconnect check failed, will retry...")

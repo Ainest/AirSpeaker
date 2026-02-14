@@ -34,7 +34,7 @@ class AirSpeakerApp(rumps.App):
         self._status_item = rumps.MenuItem("状態: 待機中")
         self._status_item.set_callback(None)
 
-        self._quit_button = rumps.MenuItem("終了", callback=self._on_quit)
+        self._quit_item = rumps.MenuItem("終了", callback=self._on_quit)
 
         self.menu = [
             self._status_item,
@@ -43,7 +43,7 @@ class AirSpeakerApp(rumps.App):
             None,
             self._stream_button,
             None,
-            self._quit_button,
+            self._quit_item,
         ]
 
         # Add initial "scanning" item and refresh button

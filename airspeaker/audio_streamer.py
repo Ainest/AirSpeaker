@@ -79,8 +79,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
         self.send_header("Cache-Control", "no-cache, no-store")
-        self.send_header("Connection", "close")
-        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("icy-name", "AirSpeaker")
         self.end_headers()
 
         cid = self.broadcaster.register()
@@ -92,10 +92,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 if chunk is None:
                     break  # client was unregistered
                 if chunk:
-                    # chunked transfer encoding
-                    self.wfile.write(f"{len(chunk):x}\r\n".encode())
                     self.wfile.write(chunk)
-                    self.wfile.write(b"\r\n")
                     self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -202,9 +199,12 @@ class AudioStreamer:
             (_StreamHandler,),
             {"broadcaster": self.broadcaster},
         )
-        self._http_server = ThreadingHTTPServer(
+        server = ThreadingHTTPServer(
             ("0.0.0.0", config.STREAM_PORT), handler
         )
+        server.allow_reuse_address = True
+        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._http_server = server
         self._server_thread = threading.Thread(
             target=self._http_server.serve_forever, daemon=True
         )
@@ -214,6 +214,10 @@ class AudioStreamer:
     def _stop_http_server(self) -> None:
         if self._http_server:
             self._http_server.shutdown()
+            try:
+                self._http_server.server_close()
+            except Exception:
+                pass
             self._http_server = None
 
 
