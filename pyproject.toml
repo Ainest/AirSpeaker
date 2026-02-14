@@ -1,0 +1,12 @@
+[project]
+name = "airspeaker"
+version = "0.1.0"
+description = "macOS menu bar app that streams computer audio to Chromecast/Google Home speakers"
+requires-python = ">=3.11"
+dependencies = [
+    "rumps>=0.4.0",
+    "pychromecast>=14.0",
+]
+
+[project.scripts]
+airspeaker = "airspeaker.main:main"
