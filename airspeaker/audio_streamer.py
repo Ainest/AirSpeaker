@@ -18,48 +18,75 @@ logger = logging.getLogger(__name__)
 # Shared MP3 stream broadcaster
 # ---------------------------------------------------------------------------
 
+# Minimum bytes to accumulate before sending to HTTP client.
+# Too small → crackling (buffer underrun on Chromecast).
+# Too large → added latency.
+_MIN_CHUNK_BYTES = 4096
+
+
 class StreamBroadcaster:
-    """Distributes MP3 chunks from ffmpeg to multiple HTTP clients."""
+    """Distributes audio chunks from ffmpeg to multiple HTTP clients."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._clients: dict[int, list[bytes]] = {}
+        self._client_sizes: dict[int, int] = {}  # accumulated byte count
         self._next_id = 0
+        self._event = threading.Event()  # signalled on each push
 
     def register(self) -> int:
-        """Register a new client, returns client id."""
         with self._lock:
             cid = self._next_id
             self._next_id += 1
             self._clients[cid] = []
+            self._client_sizes[cid] = 0
             return cid
 
     def unregister(self, cid: int) -> None:
         with self._lock:
             self._clients.pop(cid, None)
+            self._client_sizes.pop(cid, None)
 
     def push(self, data: bytes) -> None:
-        """Push an MP3 chunk to all registered clients."""
         with self._lock:
-            for buf in self._clients.values():
+            for cid, buf in self._clients.items():
                 buf.append(data)
+                self._client_sizes[cid] = self._client_sizes.get(cid, 0) + len(data)
+        self._event.set()  # wake up waiting pullers
 
-    def pull(self, cid: int, timeout: float = 1.0) -> bytes | None:
-        """Pull pending data for a client (blocking poll)."""
+    def pull(self, cid: int, timeout: float = 2.0) -> bytes | None:
+        """Pull accumulated data for a client. Waits until >= _MIN_CHUNK_BYTES."""
         import time
 
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Timeout: flush whatever we have
+                with self._lock:
+                    buf = self._clients.get(cid)
+                    if buf is None:
+                        return None
+                    if buf:
+                        data = b"".join(buf)
+                        buf.clear()
+                        self._client_sizes[cid] = 0
+                        return data
+                return b""
+
+            self._event.wait(timeout=min(remaining, 0.5))
+            self._event.clear()
+
             with self._lock:
                 buf = self._clients.get(cid)
                 if buf is None:
                     return None  # client gone
-                if buf:
+                size = self._client_sizes.get(cid, 0)
+                if size >= _MIN_CHUNK_BYTES:
                     data = b"".join(buf)
                     buf.clear()
+                    self._client_sizes[cid] = 0
                     return data
-            time.sleep(0.02)
-        return b""  # timeout, return empty to keep connection alive
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +208,7 @@ class AudioStreamer:
             return
         try:
             while self._running and proc.poll() is None:
-                data = proc.stdout.read(1024)  # small chunks for low latency
+                data = proc.stdout.read(4096)
                 if not data:
                     break
                 self.broadcaster.push(data)
@@ -217,7 +244,7 @@ class AudioStreamer:
         )
         server.allow_reuse_address = True
         server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Disable Nagle's algorithm for immediate send
+        # TCP_NODELAY on the listening socket is inherited by accepted connections
         server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._http_server = server
         self._server_thread = threading.Thread(
