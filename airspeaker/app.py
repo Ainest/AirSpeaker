@@ -1,9 +1,15 @@
-"""AirSpeaker menu bar application using rumps."""
+"""AirSpeaker menu bar application using rumps.
+
+All UI updates are dispatched to the main thread via a queue + rumps.Timer,
+because macOS/Cocoa requires menu manipulation on the main thread only.
+"""
 
 from __future__ import annotations
 
 import logging
+import queue
 import threading
+from typing import Any, Callable
 
 import rumps
 
@@ -26,6 +32,9 @@ class AirSpeakerApp(rumps.App):
         self._selected_uuid: str | None = None
         self._devices: list[CastDevice] = []
 
+        # Queue for dispatching UI updates to the main thread
+        self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+
         # Build initial menu
         self._devices_menu = rumps.MenuItem("デバイス一覧")
         self._stream_button = rumps.MenuItem(
@@ -33,12 +42,11 @@ class AirSpeakerApp(rumps.App):
         )
         self._status_item = rumps.MenuItem("状態: 待機中")
         self._status_item.set_callback(None)
-
         self._quit_item = rumps.MenuItem("終了", callback=self._on_quit)
 
         self.menu = [
             self._status_item,
-            None,  # separator
+            None,
             self._devices_menu,
             None,
             self._stream_button,
@@ -46,21 +54,40 @@ class AirSpeakerApp(rumps.App):
             self._quit_item,
         ]
 
-        # Add initial "scanning" item and refresh button
+        # Initial submenu
         self._devices_menu.add(rumps.MenuItem("検索中...", callback=None))
-        self._devices_menu.add(None)  # separator
+        self._devices_menu.add(None)
         self._devices_menu.add(
             rumps.MenuItem("デバイスを再検索", callback=self._on_refresh_devices)
         )
 
-        # Start initial discovery in background
+        # Timer that drains the UI queue on the main thread (every 0.3s)
+        self._ui_timer = rumps.Timer(self._drain_ui_queue, 0.3)
+        self._ui_timer.start()
+
+        # Start initial discovery
         self._start_discovery()
+
+    # ---- Main-thread dispatch ----
+
+    def _run_on_main(self, fn: Callable[[], None]) -> None:
+        """Schedule a callable to run on the main thread."""
+        self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self, _: Any) -> None:
+        """Called by rumps.Timer on the main thread; process pending UI work."""
+        while not self._ui_queue.empty():
+            try:
+                fn = self._ui_queue.get_nowait()
+                fn()
+            except queue.Empty:
+                break
+            except Exception:
+                logger.exception("Error in UI update")
 
     # ---- Device discovery ----
 
     def _start_discovery(self) -> None:
-        """Kick off device discovery in background."""
-        # Update menu to show scanning
         self._update_device_menu_scanning()
         self.cast.discover(callback=self._on_devices_found)
 
@@ -68,13 +95,11 @@ class AirSpeakerApp(rumps.App):
         self._start_discovery()
 
     def _on_devices_found(self, devices: list[CastDevice]) -> None:
-        """Called from discovery thread when devices are found."""
+        """Called from discovery thread. Dispatch UI update to main thread."""
         self._devices = devices
-        # rumps UI updates must happen; rumps is thread-safe for menu updates
-        self._update_device_menu(devices)
+        self._run_on_main(lambda: self._update_device_menu(devices))
 
     def _update_device_menu_scanning(self) -> None:
-        """Show 'scanning...' state in device submenu."""
         self._devices_menu.clear()
         self._devices_menu.add(rumps.MenuItem("検索中...", callback=None))
         self._devices_menu.add(None)
@@ -83,20 +108,19 @@ class AirSpeakerApp(rumps.App):
         )
 
     def _update_device_menu(self, devices: list[CastDevice]) -> None:
-        """Rebuild the device submenu with discovered devices."""
         self._devices_menu.clear()
 
         if not devices:
-            self._devices_menu.add(rumps.MenuItem("デバイスが見つかりません", callback=None))
+            self._devices_menu.add(
+                rumps.MenuItem("デバイスが見つかりません", callback=None)
+            )
         else:
             for dev in devices:
-                label = f"{dev.friendly_name}"
+                label = dev.friendly_name
                 if dev.model_name:
                     label += f" ({dev.model_name})"
                 item = rumps.MenuItem(label, callback=self._on_device_selected)
-                # Store uuid in the menu item's key for later retrieval
                 item.representedObject = dev.uuid
-                # Mark currently selected device
                 if dev.uuid == self._selected_uuid:
                     item.state = True
                 self._devices_menu.add(item)
@@ -107,34 +131,30 @@ class AirSpeakerApp(rumps.App):
         )
 
     def _on_device_selected(self, sender: rumps.MenuItem) -> None:
-        """Handle device selection from menu."""
         uuid = getattr(sender, "representedObject", None)
         if not uuid:
             return
 
-        # Toggle selection
         if uuid == self._selected_uuid:
-            # Deselect
             self._selected_uuid = None
             if self._streaming:
-                self._stop_streaming()
+                threading.Thread(target=self._stop_streaming_bg, daemon=True).start()
         else:
-            # Select new device
             was_streaming = self._streaming
             if was_streaming:
-                self._stop_streaming()
+                self._stop_streaming_sync()
             self._selected_uuid = uuid
             if was_streaming:
                 self._start_streaming()
 
-        # Refresh checkmarks
         self._update_device_menu(self._devices)
 
     # ---- Streaming control ----
 
     def _toggle_streaming(self, sender: rumps.MenuItem) -> None:
         if self._streaming:
-            self._stop_streaming()
+            self._set_status("停止中...")
+            threading.Thread(target=self._stop_streaming_bg, daemon=True).start()
         else:
             self._start_streaming()
 
@@ -147,54 +167,70 @@ class AirSpeakerApp(rumps.App):
             return
 
         self._set_status("開始中...")
-        self._stream_button.title = "停止中..."
+        self._stream_button.title = "接続中..."
         self._stream_button.set_callback(None)
 
-        # Run connection in background to avoid blocking UI
         threading.Thread(target=self._start_streaming_bg, daemon=True).start()
 
     def _start_streaming_bg(self) -> None:
+        """Background thread: start streamer + connect to Chromecast."""
         try:
-            # Start audio capture + HTTP server
             self.streamer.start()
             stream_url = self.streamer.stream_url
-
-            # Connect to Chromecast and start playback
             success = self.cast.connect(self._selected_uuid, stream_url)
 
             if success:
                 self._streaming = True
                 device = self.cast.connected_device
                 name = device.friendly_name if device else "Unknown"
-                self._set_status(f"配信中: {name}")
-                self._stream_button.title = "ストリーミング停止"
-                self._stream_button.set_callback(self._toggle_streaming)
-                self.title = "🔊▶"
+                self._run_on_main(lambda: self._apply_streaming_started(name))
             else:
                 self.streamer.stop()
-                self._set_status("接続失敗")
-                self._stream_button.title = "ストリーミング開始"
-                self._stream_button.set_callback(self._toggle_streaming)
-                rumps.notification(
-                    title=config.APP_NAME,
-                    subtitle="接続エラー",
-                    message="Chromecastへの接続に失敗しました。",
-                )
-        except Exception as e:
+                self._run_on_main(self._apply_streaming_failed)
+        except Exception:
             logger.exception("Failed to start streaming")
             self.streamer.stop()
-            self._set_status("エラー")
-            self._stream_button.title = "ストリーミング開始"
-            self._stream_button.set_callback(self._toggle_streaming)
+            self._run_on_main(self._apply_streaming_error)
 
-    def _stop_streaming(self) -> None:
+    def _stop_streaming_bg(self) -> None:
+        """Background thread: stop streaming."""
+        self._stop_streaming_sync()
+        self._run_on_main(self._apply_streaming_stopped)
+
+    def _stop_streaming_sync(self) -> None:
+        """Stop streaming (can be called from any thread, no UI touches)."""
         self._streaming = False
         self.cast.disconnect()
         self.streamer.stop()
+
+    # ---- UI state updates (main thread only) ----
+
+    def _apply_streaming_started(self, device_name: str) -> None:
+        self._set_status(f"配信中: {device_name}")
+        self._stream_button.title = "ストリーミング停止"
+        self._stream_button.set_callback(self._toggle_streaming)
+        self.title = "🔊▶"
+
+    def _apply_streaming_stopped(self) -> None:
         self._set_status("待機中")
         self._stream_button.title = "ストリーミング開始"
         self._stream_button.set_callback(self._toggle_streaming)
         self.title = "🔊"
+
+    def _apply_streaming_failed(self) -> None:
+        self._set_status("接続失敗")
+        self._stream_button.title = "ストリーミング開始"
+        self._stream_button.set_callback(self._toggle_streaming)
+        rumps.notification(
+            title=config.APP_NAME,
+            subtitle="接続エラー",
+            message="Chromecastへの接続に失敗しました。",
+        )
+
+    def _apply_streaming_error(self) -> None:
+        self._set_status("エラー")
+        self._stream_button.title = "ストリーミング開始"
+        self._stream_button.set_callback(self._toggle_streaming)
 
     def _set_status(self, text: str) -> None:
         self._status_item.title = f"状態: {text}"
@@ -202,5 +238,7 @@ class AirSpeakerApp(rumps.App):
     # ---- Cleanup ----
 
     def _on_quit(self, _: rumps.MenuItem) -> None:
-        self._stop_streaming()
+        self._streaming = False
+        self.cast.disconnect()
+        self.streamer.stop()
         rumps.quit_application()
