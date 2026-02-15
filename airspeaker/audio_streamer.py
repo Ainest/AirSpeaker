@@ -77,7 +77,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Content-Type", config.stream_content_type())
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("Connection", "keep-alive")
         self.send_header("icy-name", "AirSpeaker")
@@ -118,6 +118,7 @@ class AudioStreamer:
         self._ffmpeg_proc: subprocess.Popen | None = None
         self._http_server: ThreadingHTTPServer | None = None
         self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._server_thread: threading.Thread | None = None
         self._running = False
 
@@ -142,15 +143,9 @@ class AudioStreamer:
 
     # -- ffmpeg management --
 
-    def _build_ffmpeg_cmd(self) -> list[str]:
-        cmd = []
-        for part in config.FFMPEG_CMD_TEMPLATE:
-            cmd.append(part.replace("{device}", self.device))
-        return cmd
-
     def _start_ffmpeg(self) -> None:
-        cmd = self._build_ffmpeg_cmd()
-        logger.debug("Starting ffmpeg: %s", " ".join(cmd))
+        cmd = config.build_ffmpeg_cmd(self.device)
+        logger.info("Starting ffmpeg: %s", " ".join(cmd))
         self._ffmpeg_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -161,6 +156,11 @@ class AudioStreamer:
             target=self._read_ffmpeg_output, daemon=True
         )
         self._reader_thread.start()
+        # Drain stderr to prevent pipe buffer overflow
+        self._stderr_thread = threading.Thread(
+            target=self._drain_ffmpeg_stderr, daemon=True
+        )
+        self._stderr_thread.start()
 
     def _stop_ffmpeg(self) -> None:
         proc = self._ffmpeg_proc
@@ -175,13 +175,13 @@ class AudioStreamer:
             proc.wait()
 
     def _read_ffmpeg_output(self) -> None:
-        """Read MP3 data from ffmpeg stdout and push to broadcaster."""
+        """Read audio data from ffmpeg stdout and push to broadcaster."""
         proc = self._ffmpeg_proc
         if proc is None or proc.stdout is None:
             return
         try:
             while self._running and proc.poll() is None:
-                data = proc.stdout.read(4096)
+                data = proc.stdout.read(1024)  # small chunks for low latency
                 if not data:
                     break
                 self.broadcaster.push(data)
@@ -190,6 +190,19 @@ class AudioStreamer:
         finally:
             if self._running:
                 logger.warning("ffmpeg process ended unexpectedly")
+
+    def _drain_ffmpeg_stderr(self) -> None:
+        """Read and log ffmpeg stderr to prevent pipe buffer overflow."""
+        proc = self._ffmpeg_proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                msg = line.decode(errors="replace").rstrip()
+                if msg:
+                    logger.warning("ffmpeg: %s", msg)
+        except Exception:
+            pass
 
     # -- HTTP server management --
 
@@ -204,6 +217,8 @@ class AudioStreamer:
         )
         server.allow_reuse_address = True
         server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Disable Nagle's algorithm for immediate send
+        server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._http_server = server
         self._server_thread = threading.Thread(
             target=self._http_server.serve_forever, daemon=True

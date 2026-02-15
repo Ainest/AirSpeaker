@@ -186,13 +186,15 @@ class CastController:
         if not self._cast:
             return
         mc = self._cast.media_controller
+        content_type = config.stream_content_type()
         mc.play_media(
             self._stream_url,
-            "audio/mpeg",
+            content_type,
             stream_type="LIVE",
         )
         mc.block_until_active(timeout=10)
-        logger.info("Streaming to %s: %s", self._cast.name, self._stream_url)
+        logger.info("Streaming to %s (%s): %s",
+                    self._cast.name, content_type, self._stream_url)
 
     # ---- Auto-reconnect ----
 
